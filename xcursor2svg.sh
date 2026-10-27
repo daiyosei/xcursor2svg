@@ -1,13 +1,14 @@
 #!/usr/bin/env bash
-# Convert an Xcursor theme to pixel-based SVG cursors.
+# Convert an Xcursor theme to SVG cursors with embedded bitmaps.
 set -euo pipefail
 export LC_ALL=C
 
 usage() {
-    echo "Usage: $0 [--res SIZE] [-y | -n] THEME_DIRECTORY_OR_NAME"
+    echo "Usage: $0 [--res SIZE] [--pixel] [-y | -n] THEME_DIRECTORY_OR_NAME"
     echo "Point to the Xcursor theme directory containing the cursors/ subdirectory."
     echo "An installed theme name can also be used."
     echo "  --res SIZE  Nominal cursor size (default: 32)."
+    echo "  --pixel     Draw each pixel as an SVG rectangle instead of embedding the bitmap."
     echo "  -y          Automatically install after conversion."
     echo "  -n          Convert only; do not install."
     echo "Example: $0 --res 64 -y miku-cursor-linux"
@@ -17,6 +18,7 @@ die() { echo "Error: $*" >&2; exit 1; }
 
 res=32
 theme=
+method=embed
 install_mode=ask
 while (($#)); do
     case "$1" in
@@ -25,6 +27,7 @@ while (($#)); do
             res=$2
             shift 2
             ;;
+        --pixel) method=pixel; shift ;;
         -y) [[ $install_mode != n ]] || die "Use either -y or -n, not both."; install_mode=y; shift ;;
         -n) [[ $install_mode != y ]] || die "Use either -y or -n, not both."; install_mode=n; shift ;;
         -h|--help) usage; exit 0 ;;
@@ -40,6 +43,9 @@ done
 for command in xcur2png awk readlink; do
     command -v "$command" >/dev/null || die "Required command not found: $command"
 done
+if [[ $method == embed ]]; then
+    command -v base64 >/dev/null || die "Required command not found: base64"
+fi
 if command -v magick >/dev/null; then
     image_command=magick
 elif command -v convert >/dev/null; then
@@ -94,7 +100,7 @@ else
 fi
 
 convert_cursor() {
-    local cursor=$1 shape=$2 selected size xhot yhot png delay
+    local cursor=$1 shape=$2 selected size xhot yhot png delay bitmap
     local width height scaled_width scaled_height hotspot_x hotspot_y extraction_log frame=0 comma=
     local directory=$build/cursors_scalable/$shape
 
@@ -125,28 +131,39 @@ convert_cursor() {
         read -r hotspot_x hotspot_y < <(awk -v x="$xhot" -v y="$yhot" -v w="$width" -v h="$height" \
             -v sw="$scaled_width" -v sh="$scaled_height" 'BEGIN {printf "%.8f %.8f\n", x*sw/w, y*sh/h}')
 
-        # Nearest-neighbor resizing preserves hard pixel edges. Each visible
-        # pixel becomes a unit rectangle, including its original alpha.
-        "$image_command" "$png" -filter point -resize "${scaled_width}x${scaled_height}!" \
-            -colorspace sRGB -alpha on -depth 8 txt:- |
-            awk -v w="$scaled_width" -v h="$scaled_height" '
-                BEGIN {
-                    printf "<svg xmlns=\"http://www.w3.org/2000/svg\" width=\"%d\" height=\"%d\" viewBox=\"0 0 %d %d\" shape-rendering=\"crispEdges\">\n", w,h,w,h
-                }
-                /^#/ {next}
-                {
-                    split($1, xy, /[:,]/)
-                    hex=""
-                    for (i=2; i<=NF; i++) if ($i ~ /^#[[:xdigit:]]+$/) {hex=$i; break}
-                    if (length(hex) != 9) exit 1
-                    alpha=16*(index("0123456789ABCDEF", toupper(substr(hex,8,1)))-1) + index("0123456789ABCDEF", toupper(substr(hex,9,1)))-1
-                    if (alpha == 0) next
-                    printf "<rect x=\"%d\" y=\"%d\" width=\"1\" height=\"1\" fill=\"%s\"", xy[1],xy[2],substr(hex,1,7)
-                    if (alpha < 255) printf " fill-opacity=\"%.8f\"", alpha/255
-                    print "/>"
-                }
-                END {print "</svg>"}
-            ' > "$directory/frame-$frame.svg"
+        # Nearest-neighbor resizing preserves hard pixel edges. By default the
+        # bitmap is resized and embedded in the SVG as a base64 data URI.
+        # With --pixel, each visible pixel becomes a unit rectangle instead.
+        if [[ $method == pixel ]]; then
+            "$image_command" "$png" -filter point -resize "${scaled_width}x${scaled_height}!" \
+                -colorspace sRGB -alpha on -depth 8 txt:- |
+                awk -v w="$scaled_width" -v h="$scaled_height" '
+                    BEGIN {
+                        printf "<svg xmlns=\"http://www.w3.org/2000/svg\" width=\"%d\" height=\"%d\" viewBox=\"0 0 %d %d\" shape-rendering=\"crispEdges\">\n", w,h,w,h
+                    }
+                    /^#/ {next}
+                    {
+                        split($1, xy, /[:,]/)
+                        hex=""
+                        for (i=2; i<=NF; i++) if ($i ~ /^#[[:xdigit:]]+$/) {hex=$i; break}
+                        if (length(hex) != 9) exit 1
+                        alpha=16*(index("0123456789ABCDEF", toupper(substr(hex,8,1)))-1) + index("0123456789ABCDEF", toupper(substr(hex,9,1)))-1
+                        if (alpha == 0) next
+                        printf "<rect x=\"%d\" y=\"%d\" width=\"1\" height=\"1\" fill=\"%s\"", xy[1],xy[2],substr(hex,1,7)
+                        if (alpha < 255) printf " fill-opacity=\"%.8f\"", alpha/255
+                        print "/>"
+                    }
+                    END {print "</svg>"}
+                ' > "$directory/frame-$frame.svg"
+        else
+            bitmap=$("$image_command" "$png" -filter point -resize "${scaled_width}x${scaled_height}!" \
+                -colorspace sRGB -alpha on -depth 8 png:- | base64 -w0) ||
+                die "Cannot encode $png"
+            [[ -n $bitmap ]] || die "Cannot encode $png"
+            printf '<svg xmlns="http://www.w3.org/2000/svg" xmlns:xlink="http://www.w3.org/1999/xlink" width="%d" height="%d" viewBox="0 0 %d %d" image-rendering="optimizeSpeed">\n<image width="%d" height="%d" xlink:href="data:image/png;base64,%s"/>\n</svg>\n' \
+                "$scaled_width" "$scaled_height" "$scaled_width" "$scaled_height" \
+                "$scaled_width" "$scaled_height" "$bitmap" > "$directory/frame-$frame.svg"
+        fi
         printf '%s  {"filename":"frame-%s.svg","delay":%s,"hotspot_x":%s,"hotspot_y":%s,"nominal_size":%s}' \
             "$comma" "$frame" "${delay:-0}" "$hotspot_x" "$hotspot_y" "$res" >> "$directory/metadata.json"
         comma=$',\n'
